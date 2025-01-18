@@ -110,20 +110,19 @@ static esp_err_t init_sdcard(void)
 
     // XIAO ESP32S3 Sense SD Card Pins
     spi_bus_config_t bus_cfg = {
-        .mosi_io_num = 37,    // SD Card MOSI
-        .miso_io_num = 36,    // SD Card MISO
-        .sclk_io_num = 35,    // SD Card SCK
+        .mosi_io_num = 21,    // SD Card MOSI
+        .miso_io_num = 20,    // SD Card MISO
+        .sclk_io_num = 19,    // SD Card SCK
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
         .max_transfer_sz = 4000,
     };
 
-
     // 为所有 SPI 引脚启用上拉
-    gpio_set_pull_mode(37, GPIO_PULLUP_ONLY);    // CMD
-    gpio_set_pull_mode(36, GPIO_PULLUP_ONLY);    // D0
-    gpio_set_pull_mode(35, GPIO_PULLUP_ONLY);    // CLK
-    gpio_set_pull_mode(34, GPIO_PULLUP_ONLY);    // CS
+    gpio_set_pull_mode(21, GPIO_PULLUP_ONLY);    // CMD
+    gpio_set_pull_mode(20, GPIO_PULLUP_ONLY);    // D0
+    gpio_set_pull_mode(19, GPIO_PULLUP_ONLY);    // CLK
+    gpio_set_pull_mode(18, GPIO_PULLUP_ONLY);    // CS
 
     ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
     if (ret != ESP_OK) {
@@ -132,7 +131,7 @@ static esp_err_t init_sdcard(void)
     }
 
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = 34;     // SD Card CS
+    slot_config.gpio_cs = 18;     // SD Card CS
     slot_config.host_id = SPI2_HOST;
 
     // 使用较低的频率进行初始化
