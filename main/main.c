@@ -18,12 +18,13 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "camera_pins.h"
+#include "sdcard.h"
 
 static const char *TAG = "video_recorder";
 
 // SD card configuration
 #define MOUNT_POINT "/sdcard"
-sdmmc_card_t *card;
+static sdcard_t* sd_card = NULL;
 const char mount_point[] = MOUNT_POINT;
 
 // I2S PDM microphone configuration
@@ -32,6 +33,12 @@ const char mount_point[] = MOUNT_POINT;
 #define I2S_BITS_PER_SAMPLE (16)
 #define DMA_BUFFER_COUNT    (8)
 #define DMA_BUFFER_LEN      (1024)
+
+// Pin assignments for XIAO ESP32S3
+#define PIN_NUM_MISO  8
+#define PIN_NUM_MOSI  9
+#define PIN_NUM_CLK   7
+#define PIN_NUM_CS    21
 
 // Camera configuration
 static camera_config_t camera_config = {
@@ -99,63 +106,46 @@ static esp_err_t init_sdcard(void)
 {
     esp_err_t ret;
 
-    // Options for mounting the filesystem.
-    esp_vfs_fat_mount_config_t mount_config = {
-        .format_if_mount_failed = false,
-        .max_files = 5,
-        .allocation_unit_size = 16 * 1024
+    // Configure SD card
+    sdcard_config_t sd_config = {
+        .mosi_pin = PIN_NUM_MOSI,          // SD Card MOSI (GPIO37)
+        .miso_pin = PIN_NUM_MISO,          // SD Card MISO (GPIO35)
+        .sclk_pin = PIN_NUM_CLK,          // SD Card SCK (GPIO36)
+        .cs_pin = PIN_NUM_CS,            // SD Card CS (GPIO21)
+        .max_freq_khz = 40000,   // 25 MHz
+        .host = SPI2_HOST        // Use SPI2 host
     };
 
     ESP_LOGI(TAG, "Initializing SD card");
+    ESP_LOGI(TAG, "MOSI: %d, MISO: %d, SCK: %d, CS: %d", 
+             sd_config.mosi_pin, sd_config.miso_pin, 
+             sd_config.sclk_pin, sd_config.cs_pin);
 
-    // XIAO ESP32S3 Sense SD Card Pins
-    spi_bus_config_t bus_cfg = {
-        .mosi_io_num = 21,    // SD Card MOSI
-        .miso_io_num = 20,    // SD Card MISO
-        .sclk_io_num = 19,    // SD Card SCK
-        .quadwp_io_num = -1,
-        .quadhd_io_num = -1,
-        .max_transfer_sz = 4000,
-    };
-
-    // 为所有 SPI 引脚启用上拉
-    gpio_set_pull_mode(21, GPIO_PULLUP_ONLY);    // CMD
-    gpio_set_pull_mode(20, GPIO_PULLUP_ONLY);    // D0
-    gpio_set_pull_mode(19, GPIO_PULLUP_ONLY);    // CLK
-    gpio_set_pull_mode(18, GPIO_PULLUP_ONLY);    // CS
-
-    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SDSPI_DEFAULT_DMA);
+    // Initialize SD card
+    ret = sdcard_init(&sd_config, &sd_card);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize bus.");
+        ESP_LOGE(TAG, "Failed to initialize SD card");
         return ret;
     }
 
-    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = 18;     // SD Card CS
-    slot_config.host_id = SPI2_HOST;
-
-    // 使用较低的频率进行初始化
-    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = SPI2_HOST;
-    host.max_freq_khz = SDMMC_FREQ_PROBING;  // 使用探测频率
-
-    ret = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
-
+    // Get card info
+    ret = sdcard_get_info(sd_card);
     if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(TAG, "Failed to mount filesystem.");
-        } else {
-            ESP_LOGE(TAG, "Failed to initialize the card (%s). "
-                "Make sure SD card lines have pullup resistors in place.", esp_err_to_name(ret));
-        }
+        ESP_LOGE(TAG, "Failed to get card info");
+        sdcard_deinit(sd_card);
         return ret;
     }
 
-    // 初始化成功后，提高频率
-    host.max_freq_khz = SDMMC_FREQ_DEFAULT;
+    // Mount filesystem
+    ESP_LOGI(TAG, "Mounting filesystem");
+    ret = sdcard_mount(sd_card, mount_point, 5, false);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to mount filesystem");
+        sdcard_deinit(sd_card);
+        return ret;
+    }
 
-    // Card has been initialized, print its properties
-    sdmmc_card_print_info(stdout, card);
+    ESP_LOGI(TAG, "SD card mounted successfully");
     return ESP_OK;
 }
 
@@ -267,6 +257,6 @@ void app_main(void)
     record_video();
 
     // Clean up
-    ESP_ERROR_CHECK(esp_vfs_fat_sdcard_unmount(mount_point, card));
+    ESP_ERROR_CHECK(sdcard_unmount(sd_card, mount_point));
     ESP_LOGI(TAG, "Card unmounted");
 }
