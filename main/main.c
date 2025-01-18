@@ -2,30 +2,24 @@
 #include <string.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
+#include <errno.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_camera.h"
-#include "esp_vfs_fat.h"
-#include "driver/sdmmc_host.h"
-#include "driver/sdspi_host.h"
-#include "driver/spi_common.h"
-#include "sdmmc_cmd.h"
 #include "driver/i2s_std.h"
 #include "esp_vfs.h"
-#include "esp_spiffs.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "camera_pins.h"
-#include "sdcard.h"
+#include "fs_hal.h"
 
 static const char *TAG = "video_recorder";
 
-// SD card configuration
+// Mount point configuration
 #define MOUNT_POINT "/sdcard"
-static sdcard_t* sd_card = NULL;
-const char mount_point[] = MOUNT_POINT;
+static const char mount_point[] = MOUNT_POINT;
 
 // I2S PDM microphone configuration
 #define I2S_SAMPLE_RATE     (44100)
@@ -104,50 +98,45 @@ static esp_err_t init_camera(void)
 
 static esp_err_t init_sdcard(void)
 {
-    esp_err_t ret;
-
-    // Configure SD card
-    sdcard_config_t sd_config = {
-        .mosi_pin = PIN_NUM_MOSI,          // SD Card MOSI (GPIO37)
-        .miso_pin = PIN_NUM_MISO,          // SD Card MISO (GPIO35)
-        .sclk_pin = PIN_NUM_CLK,          // SD Card SCK (GPIO36)
-        .cs_pin = PIN_NUM_CS,            // SD Card CS (GPIO21)
-        .max_freq_khz = 40000,   // 25 MHz
-        .host = SPI2_HOST        // Use SPI2 host
+    // 配置文件系统
+    fs_config_t fs_config = {
+        .mount_point = mount_point,
+        .max_files = 5,
+        .format_if_mount_failed = false,
+        .sdcard = {
+            .host = SPI2_HOST,
+            .pin_mosi = PIN_NUM_MOSI,
+            .pin_miso = PIN_NUM_MISO,
+            .pin_sck = PIN_NUM_CLK,
+            .pin_cs = PIN_NUM_CS,
+            .freq_khz = 40000    // 40MHz
+        }
     };
 
-    ESP_LOGI(TAG, "Initializing SD card");
-    ESP_LOGI(TAG, "MOSI: %d, MISO: %d, SCK: %d, CS: %d", 
-             sd_config.mosi_pin, sd_config.miso_pin, 
-             sd_config.sclk_pin, sd_config.cs_pin);
-
-    // Initialize SD card
-    ret = sdcard_init(&sd_config, &sd_card);
+    ESP_LOGI(TAG, "Initializing filesystem");
+    
+    // 初始化文件系统（包含SD卡初始化）
+    esp_err_t ret = fs_init(&fs_config);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize SD card");
+        ESP_LOGE(TAG, "Failed to initialize filesystem");
         return ret;
     }
 
-    // Get card info
-    ret = sdcard_get_info(sd_card);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get card info");
-        sdcard_deinit(sd_card);
-        return ret;
+    // 获取并显示文件系统信息
+    fs_info_t fs_info;
+    ret = fs_get_info(&fs_info);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "Filesystem info:");
+        ESP_LOGI(TAG, "- Total space: %llu bytes", fs_info.total_bytes);
+        ESP_LOGI(TAG, "- Used space: %llu bytes", fs_info.used_bytes);
+        ESP_LOGI(TAG, "- Free space: %llu bytes", fs_info.free_bytes);
     }
 
-    // Mount filesystem
-    ESP_LOGI(TAG, "Mounting filesystem");
-    ret = sdcard_mount(sd_card, mount_point, 5, false);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to mount filesystem");
-        sdcard_deinit(sd_card);
-        return ret;
-    }
-
-    ESP_LOGI(TAG, "SD card mounted successfully");
+    ESP_LOGI(TAG, "Filesystem initialized successfully");
     return ESP_OK;
 }
+
+static i2s_chan_handle_t i2s_handle = NULL;
 
 static esp_err_t init_i2s(void)
 {
@@ -170,70 +159,184 @@ static esp_err_t init_i2s(void)
         },
     };
 
+    ESP_LOGI(TAG, "Initializing I2S");
+    ESP_LOGI(TAG, "BCLK: %d, WS: %d, DIN: %d", 
+             std_cfg.gpio_cfg.bclk, std_cfg.gpio_cfg.ws, std_cfg.gpio_cfg.din);
+
     // Initialize I2S channel
-    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, NULL));
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &i2s_handle));
     
     // Initialize I2S standard mode
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(I2S_NUM_0, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_handle, &std_cfg));
     
     // Start I2S channel
-    ESP_ERROR_CHECK(i2s_channel_enable(I2S_NUM_0));
+    ESP_ERROR_CHECK(i2s_channel_enable(i2s_handle));
 
+    ESP_LOGI(TAG, "I2S initialized successfully");
     return ESP_OK;
 }
 
 void record_video() {
-    char filename[64];
-    int64_t time_ms = esp_timer_get_time() / 1000000;
-    sprintf(filename, "/sdcard/video_%lld.mp4", time_ms);
-    FILE* fp = fopen(filename, "wb");
-    if (fp == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for writing");
+    // 检查文件系统是否已挂载
+    fs_info_t fs_info;
+    esp_err_t ret = fs_get_info(&fs_info);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get filesystem info (err: %d)", ret);
         return;
     }
 
-    camera_fb_t *pic = NULL;
-    size_t buf_len = DMA_BUFFER_LEN * sizeof(int16_t) * I2S_CHANNEL_NUM;
-    int16_t* i2s_buffer = malloc(buf_len);
+    // 检查剩余空间
+    if (fs_info.free_bytes < (1024 * 1024)) {  // 至少需要1MB空间
+        ESP_LOGE(TAG, "Not enough space on filesystem (free: %llu bytes)", fs_info.free_bytes);
+        return;
+    }
+
+    // 检查目录状态
+    fs_file_info_t dir_info;
+    ESP_LOGI(TAG, "Checking directory status for %s", MOUNT_POINT);
+    if (fs_stat(MOUNT_POINT, &dir_info) != ESP_OK) {
+        ESP_LOGI(TAG, "Directory %s does not exist, creating...", MOUNT_POINT);
+        if (fs_mkdir(MOUNT_POINT) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create directory %s", MOUNT_POINT);
+            return;
+        }
+        // 重新获取目录状态
+        if (fs_stat(MOUNT_POINT, &dir_info) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to get directory status after creation");
+            return;
+        }
+    }
+
+    // 检查是否是目录
+    if (!dir_info.is_directory) {
+        ESP_LOGE(TAG, "%s is not a directory", MOUNT_POINT);
+        return;
+    }
+
+    // 尝试在目录中创建一个测试文件
+    char test_file[64];
+    snprintf(test_file, sizeof(test_file), MOUNT_POINT "/.test_write");
+    ESP_LOGI(TAG, "Attempting to create test file: %s", test_file);
+    
+    // 先检查文件是否已存在
+    if (fs_exists(test_file)) {
+        ESP_LOGI(TAG, "Test file already exists, attempting to delete");
+        if (fs_remove(test_file) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to delete existing test file");
+            return;
+        }
+    }
+
+    fs_file_t test_fp = fs_open(test_file, FS_FILE_WRITE);
+    if (test_fp == NULL) {
+        ESP_LOGE(TAG, "Directory %s is not writable", MOUNT_POINT);
+        return;
+    }
+    
+    ESP_LOGI(TAG, "Successfully created test file");
+    fs_close(test_fp);
+    
+    if (fs_remove(test_file) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to delete test file, but continuing...");
+    } else {
+        ESP_LOGI(TAG, "Successfully deleted test file");
+    }
+
+    // 设置时区为中国标准时间
+    setenv("TZ", "CST-8", 1);
+    tzset();
+
+    char filename[64];
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    localtime_r(&now, &timeinfo);
+    
+    // 使用更具可读性的时间戳命名文件
+    snprintf(filename, sizeof(filename), MOUNT_POINT "/VID_%04d%02d%02d_%02d%02d%02d.mp4",
+             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+             
+    ESP_LOGI(TAG, "Starting video recording to: %s", filename);
+    
+    // 尝试以二进制写入模式打开文件
+    fs_file_t fp = fs_open(filename, FS_FILE_WRITE);
+    if (fp == NULL) {
+        ESP_LOGE(TAG, "Failed to open file for writing: %s", filename);
+        return;
+    }
+
+    // 分配视频和音频缓冲区
+    size_t audio_buf_len = DMA_BUFFER_LEN * sizeof(int16_t) * I2S_CHANNEL_NUM;
+    int16_t* i2s_buffer = heap_caps_malloc(audio_buf_len, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (i2s_buffer == NULL) {
         ESP_LOGE(TAG, "Failed to allocate I2S buffer");
-        fclose(fp);
+        fs_close(fp);
         return;
     }
 
-    // Record for 10 seconds
+    // 录制参数
+    const int RECORD_TIME_SECONDS = 10;
+    const int64_t RECORD_TIME_MS = RECORD_TIME_SECONDS * 1000000;
     int64_t fr_start = esp_timer_get_time();
     int frame_count = 0;
+    int write_errors = 0;
+    const int MAX_WRITE_ERRORS = 5;
 
-    while ((esp_timer_get_time() - fr_start) < 10000000) {
-        pic = esp_camera_fb_get();
+    ESP_LOGI(TAG, "Recording %d seconds of video...", RECORD_TIME_SECONDS);
+
+    while ((esp_timer_get_time() - fr_start) < RECORD_TIME_MS) {
+        // 获取摄像头帧
+        camera_fb_t *pic = esp_camera_fb_get();
         if (!pic) {
             ESP_LOGE(TAG, "Camera capture failed");
+            vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        // Write video frame
-        if (fwrite(pic->buf, 1, pic->len, fp) != pic->len) {
-            ESP_LOGE(TAG, "Failed to write frame data to file");
+        // 写入视频帧
+        size_t bytes_written = fs_write(fp, pic->buf, pic->len);
+        if (bytes_written != pic->len) {
+            ESP_LOGE(TAG, "Failed to write frame data: written %d of %d bytes", bytes_written, pic->len);
+            write_errors++;
+            if (write_errors >= MAX_WRITE_ERRORS) {
+                ESP_LOGE(TAG, "Too many write errors, stopping recording");
+                esp_camera_fb_return(pic);
+                break;
+            }
         }
 
-        // Read audio data
+        // 读取音频数据
         size_t bytes_read = 0;
-        ESP_ERROR_CHECK(i2s_channel_read(I2S_NUM_0, i2s_buffer, buf_len, &bytes_read, portMAX_DELAY));
-        
-        // Write audio data
-        if (fwrite(i2s_buffer, 1, bytes_read, fp) != bytes_read) {
-            ESP_LOGE(TAG, "Failed to write audio data to file");
+        esp_err_t i2s_err = i2s_channel_read(I2S_NUM_0, i2s_buffer, audio_buf_len, &bytes_read, portMAX_DELAY);
+        if (i2s_err == ESP_OK && bytes_read > 0) {
+            // 写入音频数据
+            bytes_written = fs_write(fp, i2s_buffer, bytes_read);
+            if (bytes_written != bytes_read) {
+                ESP_LOGE(TAG, "Failed to write audio data: written %d of %d bytes", bytes_written, bytes_read);
+                write_errors++;
+            }
+        } else if (i2s_err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read I2S data: %d", i2s_err);
         }
 
         esp_camera_fb_return(pic);
         frame_count++;
+
+        // 每秒打印一次状态
+        if (frame_count % 30 == 0) {
+            int elapsed_sec = (esp_timer_get_time() - fr_start) / 1000000;
+            ESP_LOGI(TAG, "Recording... %d seconds, %d frames captured", elapsed_sec, frame_count);
+        }
     }
 
+    // 清理并关闭文件
     free(i2s_buffer);
-    fclose(fp);
+    fs_close(fp);
 
-    ESP_LOGI(TAG, "Recorded %d frames", frame_count);
+    float fps = frame_count / ((float)RECORD_TIME_SECONDS);
+    ESP_LOGI(TAG, "Recording finished: %d frames in %d seconds (%.1f fps)", 
+             frame_count, RECORD_TIME_SECONDS, fps);
 }
 
 void app_main(void)
@@ -248,6 +351,13 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    // 设置系统时间（这里设置一个固定的时间作为示例）
+    struct timeval tv = {
+        .tv_sec = 1705622400,  // 2024-01-19 00:00:00
+        .tv_usec = 0
+    };
+    settimeofday(&tv, NULL);
+
     // Initialize peripherals
     ESP_ERROR_CHECK(init_camera());
     ESP_ERROR_CHECK(init_sdcard());
@@ -257,6 +367,10 @@ void app_main(void)
     record_video();
 
     // Clean up
-    ESP_ERROR_CHECK(sdcard_unmount(sd_card, mount_point));
-    ESP_LOGI(TAG, "Card unmounted");
+    if (i2s_handle) {
+        i2s_channel_disable(i2s_handle);
+        i2s_del_channel(i2s_handle);
+    }
+    fs_deinit();
+    ESP_LOGI(TAG, "Cleanup completed");
 }

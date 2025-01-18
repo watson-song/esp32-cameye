@@ -10,6 +10,7 @@ typedef struct {
     const char* mount_point;     // 挂载点路径
     size_t max_files;           // 最大同时打开文件数
     bool format_if_mount_failed; // 挂载失败时是否格式化
+    sdcard_config_t sdcard;     // SD卡配置
 } fs_config_t;
 
 // 文件系统信息
@@ -52,11 +53,10 @@ typedef struct fs_dir_iterator_s* fs_dir_iterator_t;
 
 /**
  * @brief 初始化文件系统
- * @param sdcard SD卡句柄
- * @param config 文件系统配置
+ * @param config 文件系统配置，包含SD卡配置
  * @return ESP_OK 成功
  */
-esp_err_t fs_init(sdcard_t* sdcard, const fs_config_t* config);
+esp_err_t fs_init(const fs_config_t* config);
 
 /**
  * @brief 卸载文件系统

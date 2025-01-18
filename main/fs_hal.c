@@ -3,18 +3,19 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <errno.h>
-#include <time.h>
 #include "esp_vfs.h"
 #include "esp_vfs_fat.h"
-#include "esp_log.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdmmc_host.h"
 #include "driver/sdspi_host.h"
-#include "driver/spi_common.h"
+#include "esp_log.h"
+#include "sdcard_hal.h"
 #include "fs_hal.h"
 
 static const char* TAG = "fs_hal";
-static sdmmc_card_t* s_card = NULL;
+static char s_mount_point[ESP_VFS_PATH_MAX] = { 0 };
 static bool s_is_mounted = false;
-static char s_mount_point[ESP_VFS_PATH_MAX + 1] = { 0 };
+static sdcard_t* s_card = NULL;
 
 #define FS_MAX_PATH_LEN 128  // 设置合适的路径长度
 
@@ -69,8 +70,8 @@ static esp_err_t build_full_path(char* full_path, size_t max_len, const char* ba
     return ESP_OK;
 }
 
-esp_err_t fs_init(sdcard_t* sdcard, const fs_config_t* config) {
-    if (!sdcard || !config || !config->mount_point) {
+esp_err_t fs_init(const fs_config_t* config) {
+    if (!config || !config->mount_point) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -82,36 +83,102 @@ esp_err_t fs_init(sdcard_t* sdcard, const fs_config_t* config) {
     // 保存挂载点
     strlcpy(s_mount_point, config->mount_point, sizeof(s_mount_point));
 
+    ESP_LOGI(TAG, "Initializing SD card");
+    ESP_LOGI(TAG, "MOSI: %d, MISO: %d, SCK: %d, CS: %d", 
+             config->sdcard.pin_mosi, config->sdcard.pin_miso, 
+             config->sdcard.pin_sck, config->sdcard.pin_cs);
+
+    // 初始化SD卡
+    esp_err_t ret = sdcard_init(&config->sdcard, &s_card);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize SD card");
+        return ret;
+    }
+
+    // 获取并显示SD卡信息
+    sdcard_info_t card_info;
+    ret = sdcard_get_info(s_card, &card_info);
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "SD card info:");
+        ESP_LOGI(TAG, "- Type: %d", card_info.type);
+        ESP_LOGI(TAG, "- Capacity: %llu bytes", card_info.capacity_bytes);
+    }
+
     ESP_LOGI(TAG, "Initializing filesystem at %s", config->mount_point);
 
     // 挂载配置
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = config->format_if_mount_failed,
         .max_files = config->max_files,
-        .allocation_unit_size = 16 * 1024  // 16KB clusters
+        .allocation_unit_size = 16 * 1024,  // 16KB clusters
+        .disk_status_check_enable = true    // 启用磁盘状态检查
     };
+
+    ESP_LOGI(TAG, "Mounting filesystem with following config:");
+    ESP_LOGI(TAG, "- Mount point: %s", config->mount_point);
+    ESP_LOGI(TAG, "- Max files: %d", mount_config.max_files);
+    ESP_LOGI(TAG, "- Format if mount failed: %d", mount_config.format_if_mount_failed);
+    ESP_LOGI(TAG, "- Allocation unit size: %d", mount_config.allocation_unit_size);
 
     // 准备SDMMC主机配置
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
-    host.slot = sdcard->spi;
-    host.max_freq_khz = sdcard->sdcard->max_freq_khz;
+    host.slot = s_card->spi;
+    host.max_freq_khz = s_card->sdcard->max_freq_khz;
 
     // 准备SDSPI设备配置
     sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
-    slot_config.gpio_cs = sdcard->pin_cs;
-    slot_config.host_id = sdcard->host;
+    slot_config.gpio_cs = s_card->pin_cs;
+    slot_config.host_id = s_card->host;
 
     // 挂载文件系统
-    esp_err_t ret = esp_vfs_fat_sdspi_mount(config->mount_point, &host, &slot_config, &mount_config, &s_card);
+    ret = esp_vfs_fat_sdspi_mount(config->mount_point, &host, &slot_config, &mount_config, &s_card->sdcard);
     if (ret != ESP_OK) {
         if (ret == ESP_FAIL) {
             ESP_LOGE(TAG, "Failed to mount filesystem. If you want the card to be formatted, set format_if_mount_failed = true.");
         } else {
             ESP_LOGE(TAG, "Failed to initialize the card (%s)", esp_err_to_name(ret));
         }
+        sdcard_deinit(s_card);
         s_mount_point[0] = '\0';
         return ret;
     }
+
+    // 确保挂载点目录存在
+    struct stat st;
+    ESP_LOGI(TAG, "Checking mount point directory");
+    if (stat(config->mount_point, &st) != 0) {
+        ESP_LOGI(TAG, "Mount point directory does not exist (errno: %d), creating...", errno);
+        if (mkdir(config->mount_point, 0777) != 0) {
+            ESP_LOGE(TAG, "Failed to create mount point directory: %s (errno: %d, %s)", 
+                    config->mount_point, errno, strerror(errno));
+            esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
+            sdcard_deinit(s_card);
+            s_mount_point[0] = '\0';
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "Mount point directory created successfully");
+    } else {
+        ESP_LOGI(TAG, "Mount point directory exists:");
+        ESP_LOGI(TAG, "- Mode: %lu", (unsigned long)(st.st_mode & 0777));
+        ESP_LOGI(TAG, "- UID: %lu, GID: %lu", (unsigned long)st.st_uid, (unsigned long)st.st_gid);
+    }
+
+    // 尝试创建一个测试文件来验证文件系统是否正常工作
+    char test_path[128];
+    snprintf(test_path, sizeof(test_path), "%s/.fs_test", config->mount_point);
+    ESP_LOGI(TAG, "Testing filesystem by creating file: %s", test_path);
+    
+    FILE* fp = fopen(test_path, "wb");
+    if (fp == NULL) {
+        ESP_LOGE(TAG, "Failed to create test file (errno: %d, %s)", errno, strerror(errno));
+        esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
+        sdcard_deinit(s_card);
+        s_mount_point[0] = '\0';
+        return ESP_FAIL;
+    }
+    fclose(fp);
+    unlink(test_path);
+    ESP_LOGI(TAG, "Filesystem test successful");
 
     s_is_mounted = true;
     ESP_LOGI(TAG, "Filesystem mounted successfully");
@@ -124,7 +191,7 @@ esp_err_t fs_deinit(void) {
     }
 
     // 卸载文件系统
-    esp_err_t ret = esp_vfs_fat_sdcard_unmount(s_mount_point, s_card);
+    esp_err_t ret = esp_vfs_fat_sdcard_unmount(s_mount_point, s_card->sdcard);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to unmount filesystem");
         return ret;
@@ -132,6 +199,7 @@ esp_err_t fs_deinit(void) {
 
     s_is_mounted = false;
     s_mount_point[0] = '\0';
+    sdcard_deinit(s_card);
     s_card = NULL;
     return ESP_OK;
 }
@@ -391,15 +459,16 @@ esp_err_t fs_closedir(fs_dir_iterator_t iterator) {
     return ret;
 }
 
+static esp_err_t remove_dir_contents(const char* path) __attribute__((unused));
 static esp_err_t remove_dir_contents(const char* path) {
-    fs_dir_iterator_t iterator = NULL;
-    esp_err_t ret = fs_opendir(path, &iterator);
+    fs_dir_iterator_t it;
+    esp_err_t ret = fs_opendir(path, &it);
     if (ret != ESP_OK) {
         return ret;
     }
 
     fs_file_info_t info;
-    while (fs_readdir(iterator, &info) == ESP_OK) {
+    while (fs_readdir(it, &info) == ESP_OK) {
         // 跳过 "." 和 ".." 目录
         if (strcmp(info.name, ".") == 0 || strcmp(info.name, "..") == 0) {
             continue;
@@ -407,7 +476,7 @@ static esp_err_t remove_dir_contents(const char* path) {
 
         char path_buf[ESP_VFS_PATH_MAX + 1];
         if (snprintf(path_buf, sizeof(path_buf), "%s/%s", path, info.name) >= sizeof(path_buf)) {
-            fs_closedir(iterator);
+            fs_closedir(it);
             return ESP_ERR_INVALID_ARG;
         }
 
@@ -420,12 +489,12 @@ static esp_err_t remove_dir_contents(const char* path) {
         }
 
         if (ret != ESP_OK) {
-            fs_closedir(iterator);
+            fs_closedir(it);
             return ret;
         }
     }
 
-    fs_closedir(iterator);
+    fs_closedir(it);
     return ESP_OK;
 }
 
@@ -534,4 +603,59 @@ bool fs_has_space(uint64_t required_size) {
     }
 
     return info.free_bytes >= required_size;
+}
+
+fs_file_t fs_open(const char* path, fs_mode_t mode) {
+    if (!path || !s_is_mounted) {
+        return NULL;
+    }
+
+    const char* mode_str;
+    switch (mode) {
+        case FS_FILE_READ:
+            mode_str = "rb";
+            break;
+        case FS_FILE_WRITE:
+            mode_str = "wb";
+            break;
+        case FS_FILE_APPEND:
+            mode_str = "ab";
+            break;
+        default:
+            ESP_LOGE(TAG, "Invalid file mode: %d", mode);
+            return NULL;
+    }
+
+    FILE* fp = fopen(path, mode_str);
+    if (!fp) {
+        ESP_LOGE(TAG, "Failed to open file %s (mode: %s, errno: %d, %s)", 
+                path, mode_str, errno, strerror(errno));
+    }
+    return (fs_file_t)fp;
+}
+
+esp_err_t fs_close(fs_file_t file) {
+    if (!file) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    FILE* fp = (FILE*)file;
+    if (fclose(fp) != 0) {
+        ESP_LOGE(TAG, "Failed to close file (errno: %d, %s)", errno, strerror(errno));
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+int fs_write(fs_file_t file, const void* buf, size_t size) {
+    if (!file || !buf || size == 0) {
+        return -1;
+    }
+    FILE* fp = (FILE*)file;
+    size_t written = fwrite(buf, 1, size, fp);
+    if (written != size) {
+        ESP_LOGE(TAG, "Failed to write data: written %d of %d bytes (errno: %d, %s)", 
+                written, size, errno, strerror(errno));
+        return -1;
+    }
+    return (int)written;
 }
