@@ -37,8 +37,13 @@ typedef struct {
     sdmmc_card_t* sdcard;  // Keep the sdcard structure for read/write operations
 } sdcard_t;
 
-esp_err_t sdcard_init(const sdcard_config_t* config, sdcard_t** out_card);
-esp_err_t sdcard_deinit(sdcard_t* card);
+// SPI模式的SD卡操作函数
+esp_err_t sdspi_card_init(const sdcard_config_t* config, sdcard_t** out_card);
+esp_err_t sdspi_card_deinit(sdcard_t* card);
 esp_err_t sdcard_read_blocks(sdcard_t* card, size_t start_block, size_t n_blocks, void* dst);
 esp_err_t sdcard_write_blocks(sdcard_t* card, size_t start_block, size_t n_blocks, const void* src);
 esp_err_t sdcard_get_info(sdcard_t* card, sdcard_info_t* out_info);
+
+// 为了向后兼容，保留旧的函数名作为别名
+#define sdcard_init sdspi_card_init
+#define sdcard_deinit sdspi_card_deinit

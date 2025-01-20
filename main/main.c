@@ -60,11 +60,11 @@ static camera_config_t camera_config = {
     .ledc_channel = LEDC_CHANNEL_0,
 
     .pixel_format = PIXFORMAT_JPEG,
-    .frame_size = FRAMESIZE_VGA,     // 降低分辨率
-    .jpeg_quality = 12,
-    .fb_count = 1,                   // 减少缓冲区数量
-    .fb_location = CAMERA_FB_IN_DRAM,// 使用 DRAM 而不是 PSRAM
-    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+    .frame_size = FRAMESIZE_QVGA,    // 使用更小的分辨率
+    .jpeg_quality = 15,              // 提高质量以减少压缩时间
+    .fb_count = 2,                   // 增加缓冲区数量
+    .fb_location = CAMERA_FB_IN_PSRAM,// 使用 PSRAM
+    .grab_mode = CAMERA_GRAB_LATEST,  // 总是获取最新的帧
     
     .sccb_i2c_port = 1
 };
@@ -84,13 +84,16 @@ static esp_err_t init_camera(void)
         return ESP_FAIL;
     }
 
-    // 降低初始设置，提高兼容性
-    s->set_framesize(s, FRAMESIZE_QVGA);
-    s->set_quality(s, 15);
+    // 使用与配置一致的设置
     s->set_brightness(s, 1);
     s->set_contrast(s, 1);
     s->set_saturation(s, 1);
     s->set_sharpness(s, 1);
+    s->set_gainceiling(s, GAINCEILING_2X);  // 增加增益
+    s->set_exposure_ctrl(s, 1);             // 启用自动曝光
+    s->set_aec2(s, 1);                      // 启用高级自动曝光
+    s->set_gain_ctrl(s, 1);                 // 启用自动增益
+    s->set_awb_gain(s, 1);                  // 启用自动白平衡增益
 
     ESP_LOGI(TAG, "Camera Init Success");
     return ESP_OK;
@@ -191,57 +194,6 @@ void record_video() {
         return;
     }
 
-    // 检查目录状态
-    fs_file_info_t dir_info;
-    ESP_LOGI(TAG, "Checking directory status for %s", MOUNT_POINT);
-    if (fs_stat(MOUNT_POINT, &dir_info) != ESP_OK) {
-        ESP_LOGI(TAG, "Directory %s does not exist, creating...", MOUNT_POINT);
-        if (fs_mkdir(MOUNT_POINT) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to create directory %s", MOUNT_POINT);
-            return;
-        }
-        // 重新获取目录状态
-        if (fs_stat(MOUNT_POINT, &dir_info) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to get directory status after creation");
-            return;
-        }
-    }
-
-    // 检查是否是目录
-    if (!dir_info.is_directory) {
-        ESP_LOGE(TAG, "%s is not a directory", MOUNT_POINT);
-        return;
-    }
-
-    // 尝试在目录中创建一个测试文件
-    char test_file[64];
-    snprintf(test_file, sizeof(test_file), MOUNT_POINT "/.test_write");
-    ESP_LOGI(TAG, "Attempting to create test file: %s", test_file);
-    
-    // 先检查文件是否已存在
-    if (fs_exists(test_file)) {
-        ESP_LOGI(TAG, "Test file already exists, attempting to delete");
-        if (fs_remove(test_file) != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to delete existing test file");
-            return;
-        }
-    }
-
-    fs_file_t test_fp = fs_open(test_file, FS_FILE_WRITE);
-    if (test_fp == NULL) {
-        ESP_LOGE(TAG, "Directory %s is not writable", MOUNT_POINT);
-        return;
-    }
-    
-    ESP_LOGI(TAG, "Successfully created test file");
-    fs_close(test_fp);
-    
-    if (fs_remove(test_file) != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to delete test file, but continuing...");
-    } else {
-        ESP_LOGI(TAG, "Successfully deleted test file");
-    }
-
     // 设置时区为中国标准时间
     setenv("TZ", "CST-8", 1);
     tzset();
@@ -252,9 +204,8 @@ void record_video() {
     time(&now);
     localtime_r(&now, &timeinfo);
     
-    // 使用更具可读性的时间戳命名文件
-    snprintf(filename, sizeof(filename), MOUNT_POINT "/VID_%04d%02d%02d_%02d%02d%02d.mp4",
-             timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+    // 使用更简短的文件名格式
+    snprintf(filename, sizeof(filename), MOUNT_POINT "/V%02d%02d%02d.mp4",
              timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
              
     ESP_LOGI(TAG, "Starting video recording to: %s", filename);
@@ -266,8 +217,8 @@ void record_video() {
         return;
     }
 
-    // 分配视频和音频缓冲区
-    size_t audio_buf_len = DMA_BUFFER_LEN * sizeof(int16_t) * I2S_CHANNEL_NUM;
+    // 分配I2S缓冲区
+    size_t audio_buf_len = 1024;  // 每次读取1KB音频数据
     int16_t* i2s_buffer = heap_caps_malloc(audio_buf_len, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (i2s_buffer == NULL) {
         ESP_LOGE(TAG, "Failed to allocate I2S buffer");
@@ -275,35 +226,26 @@ void record_video() {
         return;
     }
 
-    // 录制参数
-    const int RECORD_TIME_SECONDS = 10;
-    const int64_t RECORD_TIME_MS = RECORD_TIME_SECONDS * 1000000;
-    int64_t fr_start = esp_timer_get_time();
+    // 开始录制
     int frame_count = 0;
     int write_errors = 0;
-    const int MAX_WRITE_ERRORS = 5;
+    int64_t fr_start = esp_timer_get_time();
 
-    ESP_LOGI(TAG, "Recording %d seconds of video...", RECORD_TIME_SECONDS);
-
-    while ((esp_timer_get_time() - fr_start) < RECORD_TIME_MS) {
-        // 获取摄像头帧
-        camera_fb_t *pic = esp_camera_fb_get();
+    ESP_LOGI(TAG, "Starting capture loop...");
+    while ((esp_timer_get_time() - fr_start) < (10 * 1000000)) {
+        // 获取一帧图像
+        camera_fb_t* pic = esp_camera_fb_get();
         if (!pic) {
-            ESP_LOGE(TAG, "Camera capture failed");
-            vTaskDelay(pdMS_TO_TICKS(100));
+            ESP_LOGE(TAG, "Failed to get camera frame");
+            write_errors++;
             continue;
         }
 
         // 写入视频帧
-        size_t bytes_written = fs_write(fp, pic->buf, pic->len);
+        int bytes_written = fs_write(fp, pic->buf, pic->len);
         if (bytes_written != pic->len) {
             ESP_LOGE(TAG, "Failed to write frame data: written %d of %d bytes", bytes_written, pic->len);
             write_errors++;
-            if (write_errors >= MAX_WRITE_ERRORS) {
-                ESP_LOGE(TAG, "Too many write errors, stopping recording");
-                esp_camera_fb_return(pic);
-                break;
-            }
         }
 
         // 读取音频数据
@@ -334,9 +276,12 @@ void record_video() {
     free(i2s_buffer);
     fs_close(fp);
 
-    float fps = frame_count / ((float)RECORD_TIME_SECONDS);
+    float fps = frame_count / ((float)10);
     ESP_LOGI(TAG, "Recording finished: %d frames in %d seconds (%.1f fps)", 
-             frame_count, RECORD_TIME_SECONDS, fps);
+             frame_count, 10, fps);
+    if (write_errors > 0) {
+        ESP_LOGW(TAG, "There were %d write errors during recording", write_errors);
+    }
 }
 
 void app_main(void)

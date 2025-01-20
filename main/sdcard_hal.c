@@ -10,11 +10,11 @@
 
 static const char* TAG = "sdcard_hal";
 
-esp_err_t sdcard_init(const sdcard_config_t* config, sdcard_t** out_card) {
+esp_err_t sdspi_card_init(const sdcard_config_t* config, sdcard_t** out_card) {
     esp_err_t ret = ESP_OK;
     sdcard_t* card = NULL;
 
-    ESP_LOGI(TAG, "Starting SD card initialization");
+    ESP_LOGI(TAG, "Starting SD card initialization (SPI mode)");
     ESP_LOGI(TAG, "Using pins - MOSI: %d, MISO: %d, CLK: %d, CS: %d",
              config->pin_mosi, config->pin_miso, config->pin_sck, config->pin_cs);
 
@@ -164,16 +164,22 @@ esp_err_t sdcard_get_info(sdcard_t* card, sdcard_info_t* out_info) {
     return ESP_OK;
 }
 
-esp_err_t sdcard_deinit(sdcard_t* card) {
+esp_err_t sdspi_card_deinit(sdcard_t* card) {
     if (!card) return ESP_ERR_INVALID_ARG;
     
+    // 先释放SD卡结构
+    if (card->sdcard) {
+        // 不需要显式释放sdcard结构，它会在sdspi_host_remove_device中被释放
+        card->sdcard = NULL;
+    }
+
+    // 移除SPI设备并释放总线
     if (card->spi) {
         sdspi_host_remove_device(card->spi);
         spi_bus_free(card->host);
     }
-    if (card->sdcard) {
-        free(card->sdcard);
-    }
+
+    // 最后释放card结构体
     free(card);
     return ESP_OK;
 }

@@ -165,18 +165,70 @@ esp_err_t fs_init(const fs_config_t* config) {
 
     // 尝试创建一个测试文件来验证文件系统是否正常工作
     char test_path[128];
-    snprintf(test_path, sizeof(test_path), "%s/.fs_test", config->mount_point);
+    snprintf(test_path, sizeof(test_path), "%s/test.txt", config->mount_point);
     ESP_LOGI(TAG, "Testing filesystem by creating file: %s", test_path);
     
-    FILE* fp = fopen(test_path, "wb");
+    // 先检查文件是否已存在
+    if (stat(test_path, &st) == 0) {
+        ESP_LOGI(TAG, "Test file already exists, attempting to delete");
+        if (unlink(test_path) != 0) {
+            ESP_LOGE(TAG, "Failed to delete existing test file (errno: %d, %s)", errno, strerror(errno));
+            esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
+            sdcard_deinit(s_card);
+            s_mount_point[0] = '\0';
+            return ESP_FAIL;
+        }
+    }
+
+    // 尝试创建并写入测试文件
+    const char test_data[] = "Test data";
+    ESP_LOGI(TAG, "Opening file for writing...");
+    FILE* fp = fopen(test_path, "w");  // 使用文本模式而不是二进制模式
     if (fp == NULL) {
         ESP_LOGE(TAG, "Failed to create test file (errno: %d, %s)", errno, strerror(errno));
+        // 尝试列出目录内容
+        DIR* dir = opendir(config->mount_point);
+        if (dir) {
+            ESP_LOGI(TAG, "Listing directory contents:");
+            struct dirent* ent;
+            while ((ent = readdir(dir)) != NULL) {
+                ESP_LOGI(TAG, "- %s", ent->d_name);
+            }
+            closedir(dir);
+        } else {
+            ESP_LOGE(TAG, "Failed to open directory (errno: %d, %s)", errno, strerror(errno));
+        }
         esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
         sdcard_deinit(s_card);
         s_mount_point[0] = '\0';
         return ESP_FAIL;
     }
+
+    ESP_LOGI(TAG, "Writing test data...");
+    if (fwrite(test_data, 1, sizeof(test_data), fp) != sizeof(test_data)) {
+        ESP_LOGE(TAG, "Failed to write to test file (errno: %d, %s)", errno, strerror(errno));
+        fclose(fp);
+        unlink(test_path);
+        esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
+        sdcard_deinit(s_card);
+        s_mount_point[0] = '\0';
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "Closing file...");
     fclose(fp);
+    
+    // 验证文件是否真的创建了
+    ESP_LOGI(TAG, "Verifying file creation...");
+    if (stat(test_path, &st) != 0) {
+        ESP_LOGE(TAG, "File does not exist after creation (errno: %d, %s)", errno, strerror(errno));
+        esp_vfs_fat_sdcard_unmount(config->mount_point, s_card->sdcard);
+        sdcard_deinit(s_card);
+        s_mount_point[0] = '\0';
+        return ESP_FAIL;
+    }
+    
+    ESP_LOGI(TAG, "Test file created successfully, size: %ld bytes", st.st_size);
     unlink(test_path);
     ESP_LOGI(TAG, "Filesystem test successful");
 
@@ -610,6 +662,41 @@ fs_file_t fs_open(const char* path, fs_mode_t mode) {
         return NULL;
     }
 
+    // 构建完整路径
+    char full_path[FS_MAX_PATH_LEN];
+    if (strncmp(path, s_mount_point, strlen(s_mount_point)) == 0) {
+        // 路径已经包含挂载点，直接使用
+        strncpy(full_path, path, sizeof(full_path) - 1);
+        full_path[sizeof(full_path) - 1] = '\0';
+    } else {
+        // 需要添加挂载点
+        int len = snprintf(full_path, sizeof(full_path), "%s%s%s", 
+                          s_mount_point, 
+                          (path[0] == '/') ? "" : "/",
+                          (path[0] == '/') ? path + 1 : path);
+        if (len >= sizeof(full_path)) {
+            ESP_LOGE(TAG, "Path too long: '%s%s%s'", 
+                    s_mount_point, 
+                    (path[0] == '/') ? "" : "/",
+                    (path[0] == '/') ? path + 1 : path);
+            return NULL;
+        }
+    }
+
+    // 规范化路径（去除多余的斜杠）
+    char* src = full_path;
+    char* dst = full_path;
+    char prev = '\0';
+    while (*src) {
+        if (*src != '/' || prev != '/') {
+            *dst = *src;
+            prev = *src;
+            dst++;
+        }
+        src++;
+    }
+    *dst = '\0';
+
     const char* mode_str;
     switch (mode) {
         case FS_FILE_READ:
@@ -626,10 +713,11 @@ fs_file_t fs_open(const char* path, fs_mode_t mode) {
             return NULL;
     }
 
-    FILE* fp = fopen(path, mode_str);
+    ESP_LOGI(TAG, "Opening file: %s (mode: %s)", full_path, mode_str);
+    FILE* fp = fopen(full_path, mode_str);
     if (!fp) {
         ESP_LOGE(TAG, "Failed to open file %s (mode: %s, errno: %d, %s)", 
-                path, mode_str, errno, strerror(errno));
+                full_path, mode_str, errno, strerror(errno));
     }
     return (fs_file_t)fp;
 }
