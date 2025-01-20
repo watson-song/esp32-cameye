@@ -1,7 +1,8 @@
 idf_component_register(
     SRCS 
+        "main.c"
         "fs_hal.c"
         "sdcard_hal.c"
-        "main.c"  # 使用新的测试文件
     INCLUDE_DIRS "."
+    REQUIRES driver esp_timer fatfs esp_camera console nvs_flash vfs
 )

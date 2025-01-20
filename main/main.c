@@ -1,25 +1,19 @@
 #include <stdio.h>
 #include <string.h>
-#include <sys/unistd.h>
-#include <sys/stat.h>
-#include "esp_err.h"
-#include "esp_log.h"
-#include "esp_camera.h"
-#include "driver/i2s_std.h"
-#include "esp_vfs.h"
-#include "nvs_flash.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "driver/i2s_pdm.h"
-#include "fs_hal.h"
-#include "sdcard_hal.h"
-#include "camera_pins.h"
-#include "esp_timer.h"
-#include <errno.h>
 #include <inttypes.h>
 #include <time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "esp_timer.h"
+#include "driver/i2s_pdm.h"
+#include "esp_camera.h"
+#include "driver/uart.h"
 #include "esp_console.h"
-#include "esp_console_dev_uart.h"
+#include "esp_vfs_dev.h"
+#include "linenoise/linenoise.h"
+#include "fs_hal.h"
+#include "camera_pins.h"
 
 static const char *TAG = "video_recorder";
 
@@ -428,10 +422,8 @@ static int console_handler(int argc, char **argv) {
 
 void app_main(void)
 {
-    esp_err_t ret;
-
-    // Initialize NVS
-    ret = nvs_flash_init();
+    // 初始化 NVS
+    esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
@@ -445,20 +437,33 @@ void app_main(void)
     };
     settimeofday(&tv, NULL);
 
-    // Initialize peripherals
+    // 初始化硬件
     ESP_ERROR_CHECK(init_camera());
     ESP_ERROR_CHECK(init_sdcard());
     ESP_ERROR_CHECK(init_i2s());
 
+    // 初始化控制台
+    esp_console_config_t console_config = {
+        .max_cmdline_length = 256,
+        .max_cmdline_args = 8,
+    };
+    ESP_ERROR_CHECK(esp_console_init(&console_config));
+
+    // 初始化 UART 设备
+    esp_vfs_dev_uart_port_set_rx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM, ESP_LINE_ENDINGS_CR);
+    esp_vfs_dev_uart_port_set_tx_line_endings(CONFIG_ESP_CONSOLE_UART_NUM, ESP_LINE_ENDINGS_CRLF);
+
+    const uart_config_t uart_config = {
+        .baud_rate = CONFIG_ESP_CONSOLE_UART_BAUDRATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    ESP_ERROR_CHECK(uart_driver_install(CONFIG_ESP_CONSOLE_UART_NUM, 256, 0, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(CONFIG_ESP_CONSOLE_UART_NUM, &uart_config));
+
     // 注册命令
-    esp_console_repl_t *repl = NULL;
-    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
-    repl_config.prompt = "esp32> ";
-    repl_config.max_cmdline_length = 256;
-
-    esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_config, &repl_config, &repl));
-
     esp_console_cmd_t cmd = {
         .command = "transfer",
         .help = "Transfer file content. Usage: transfer <filename>",
@@ -471,13 +476,38 @@ void app_main(void)
     cmd.help = "List files in root directory";
     ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
 
-    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+    // 启动控制台
+    linenoiseSetMultiLine(1);
+    linenoiseSetDumbMode(1);
 
-    // Start recording
+    printf("\n"
+           "Type 'ls' to list files\n"
+           "Type 'transfer <filename>' to transfer a file\n"
+           "\n");
+
+    // 主循环
+    while(1) {
+        char* line = linenoise("esp32> ");
+        if (line == NULL) {
+            continue;
+        }
+        
+        if (strlen(line) > 0) {
+            linenoiseHistoryAdd(line);
+            
+            int ret;
+            esp_err_t err = esp_console_run(line, &ret);
+            if (err == ESP_ERR_NOT_FOUND) {
+                printf("Command not found\n");
+            } else if (err == ESP_ERR_INVALID_ARG) {
+                printf("Invalid arguments\n");
+            } else if (err == ESP_OK && ret != ESP_OK) {
+                printf("Command returned non-zero error code: 0x%x\n", ret);
+            }
+        }
+        linenoiseFree(line);
+    }
+
+    // 开始录制
     record_video();
-
-    // Cleanup
-    deinit_i2s();
-    fs_deinit();
-    ESP_LOGI(TAG, "Cleanup completed");
 }
