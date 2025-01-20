@@ -38,22 +38,22 @@ static const char mount_point[] = MOUNT_POINT;
 static camera_config_t camera_config = {
     .pin_pwdn = PWDN_GPIO_NUM,
     .pin_reset = RESET_GPIO_NUM,
-    .pin_xclk = XCLK_GPIO_NUM,
-    .pin_sccb_sda = SIOD_GPIO_NUM,
-    .pin_sccb_scl = SIOC_GPIO_NUM,
+    .pin_xclk = XCLK_GPIO_NUM, //10
+    .pin_sccb_sda = SIOD_GPIO_NUM, //40
+    .pin_sccb_scl = SIOC_GPIO_NUM, //39
 
-    .pin_d7 = Y9_GPIO_NUM,
-    .pin_d6 = Y8_GPIO_NUM,
-    .pin_d5 = Y7_GPIO_NUM,
-    .pin_d4 = Y6_GPIO_NUM,
-    .pin_d3 = Y5_GPIO_NUM,
-    .pin_d2 = Y4_GPIO_NUM,
-    .pin_d1 = Y3_GPIO_NUM,
-    .pin_d0 = Y2_GPIO_NUM,
+    .pin_d7 = Y9_GPIO_NUM, //48
+    .pin_d6 = Y8_GPIO_NUM, //11
+    .pin_d5 = Y7_GPIO_NUM, //12
+    .pin_d4 = Y6_GPIO_NUM, //14
+    .pin_d3 = Y5_GPIO_NUM, //16
+    .pin_d2 = Y4_GPIO_NUM, //18
+    .pin_d1 = Y3_GPIO_NUM, //17
+    .pin_d0 = Y2_GPIO_NUM, //15
 
-    .pin_vsync = VSYNC_GPIO_NUM,
-    .pin_href = HREF_GPIO_NUM,
-    .pin_pclk = PCLK_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM, //38
+    .pin_href = HREF_GPIO_NUM, //47
+    .pin_pclk = PCLK_GPIO_NUM, //13
 
     .xclk_freq_hz = 20000000,
     .ledc_timer = LEDC_TIMER_0,
