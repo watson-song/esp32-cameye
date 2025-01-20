@@ -2,7 +2,6 @@
 #include <string.h>
 #include <sys/unistd.h>
 #include <sys/stat.h>
-#include <errno.h>
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_camera.h"
@@ -11,9 +10,16 @@
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_timer.h"
-#include "camera_pins.h"
+#include "driver/i2s_pdm.h"
 #include "fs_hal.h"
+#include "sdcard_hal.h"
+#include "camera_pins.h"
+#include "esp_timer.h"
+#include <errno.h>
+#include <inttypes.h>
+#include <time.h>
+#include "esp_console.h"
+#include "esp_console_dev_uart.h"
 
 static const char *TAG = "video_recorder";
 
@@ -21,39 +27,43 @@ static const char *TAG = "video_recorder";
 #define MOUNT_POINT "/sdcard"
 static const char mount_point[] = MOUNT_POINT;
 
-// I2S PDM microphone configuration
-#define I2S_SAMPLE_RATE     (44100)
-#define I2S_CHANNEL_NUM     (2)
-#define I2S_BITS_PER_SAMPLE (16)
-#define DMA_BUFFER_COUNT    (8)
-#define DMA_BUFFER_LEN      (1024)
-
-// Pin assignments for XIAO ESP32S3
+// Pin assignments for XIAO ESP32S3 Sense
 #define PIN_NUM_MISO  8
 #define PIN_NUM_MOSI  9
 #define PIN_NUM_CLK   7
 #define PIN_NUM_CS    21
 
+// I2S PDM配置
+#define I2S_CLK_IO      41  // PDM Clock
+#define I2S_DIN_IO      42  // PDM Data Input
+#define I2S_SAMPLE_RATE 16000
+#define I2S_CHANNEL_NUM 1   // PDM通常是单声道
+#define I2S_DATA_BIT_WIDTH I2S_DATA_BIT_WIDTH_16BIT
+
+// DMA配置
+#define DMA_BUFFER_COUNT    8
+#define DMA_BUFFER_LEN      1024
+
 // Camera configuration
 static camera_config_t camera_config = {
     .pin_pwdn = PWDN_GPIO_NUM,
     .pin_reset = RESET_GPIO_NUM,
-    .pin_xclk = XCLK_GPIO_NUM, //10
-    .pin_sccb_sda = SIOD_GPIO_NUM, //40
-    .pin_sccb_scl = SIOC_GPIO_NUM, //39
+    .pin_xclk = XCLK_GPIO_NUM,
+    .pin_sccb_sda = SIOD_GPIO_NUM,
+    .pin_sccb_scl = SIOC_GPIO_NUM,
 
-    .pin_d7 = Y9_GPIO_NUM, //48
-    .pin_d6 = Y8_GPIO_NUM, //11
-    .pin_d5 = Y7_GPIO_NUM, //12
-    .pin_d4 = Y6_GPIO_NUM, //14
-    .pin_d3 = Y5_GPIO_NUM, //16
-    .pin_d2 = Y4_GPIO_NUM, //18
-    .pin_d1 = Y3_GPIO_NUM, //17
-    .pin_d0 = Y2_GPIO_NUM, //15
+    .pin_d7 = Y9_GPIO_NUM,
+    .pin_d6 = Y8_GPIO_NUM,
+    .pin_d5 = Y7_GPIO_NUM,
+    .pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM,
+    .pin_d2 = Y4_GPIO_NUM,
+    .pin_d1 = Y3_GPIO_NUM,
+    .pin_d0 = Y2_GPIO_NUM,
 
-    .pin_vsync = VSYNC_GPIO_NUM, //38
-    .pin_href = HREF_GPIO_NUM, //47
-    .pin_pclk = PCLK_GPIO_NUM, //13
+    .pin_vsync = VSYNC_GPIO_NUM,
+    .pin_href = HREF_GPIO_NUM,
+    .pin_pclk = PCLK_GPIO_NUM,
 
     .xclk_freq_hz = 20000000,
     .ledc_timer = LEDC_TIMER_0,
@@ -141,147 +151,279 @@ static esp_err_t init_sdcard(void)
 
 static i2s_chan_handle_t i2s_handle = NULL;
 
-static esp_err_t init_i2s(void)
-{
-    // I2S configuration
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_BITS_PER_SAMPLE, I2S_CHANNEL_NUM),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = GPIO_NUM_41,
-            .ws = GPIO_NUM_42,
-            .dout = I2S_GPIO_UNUSED,
-            .din = GPIO_NUM_2,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false,
-            },
-        },
-    };
-
-    ESP_LOGI(TAG, "Initializing I2S");
-    ESP_LOGI(TAG, "BCLK: %d, WS: %d, DIN: %d", 
-             std_cfg.gpio_cfg.bclk, std_cfg.gpio_cfg.ws, std_cfg.gpio_cfg.din);
-
+static esp_err_t init_i2s(void) {
+    ESP_LOGI(TAG, "Initializing I2S PDM...");
+    
+    // Log GPIO configuration
+    ESP_LOGI(TAG, "CLK: %d, DIN: %d", I2S_CLK_IO, I2S_DIN_IO);
+    
     // Initialize I2S channel
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = DMA_BUFFER_COUNT;
+    chan_cfg.dma_frame_num = DMA_BUFFER_LEN;
+    
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, NULL, &i2s_handle));
     
-    // Initialize I2S standard mode
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_handle, &std_cfg));
+    i2s_pdm_rx_config_t pdm_rx_cfg = {
+        .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(I2S_SAMPLE_RATE),
+        .slot_cfg = I2S_PDM_RX_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH, I2S_CHANNEL_NUM),
+        .gpio_cfg = {
+            .clk = I2S_CLK_IO,
+            .din = I2S_DIN_IO,
+        },
+    };
     
-    // Start I2S channel
+    ESP_ERROR_CHECK(i2s_channel_init_pdm_rx_mode(i2s_handle, &pdm_rx_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(i2s_handle));
+    
+    ESP_LOGI(TAG, "I2S PDM initialized successfully");
+    return ESP_OK;
+}
 
-    ESP_LOGI(TAG, "I2S initialized successfully");
+static void deinit_i2s(void) {
+    if (i2s_handle) {
+        i2s_channel_disable(i2s_handle);
+        i2s_del_channel(i2s_handle);
+        i2s_handle = NULL;
+    }
+}
+
+#define AUDIO_BUFFER_SIZE (DMA_BUFFER_LEN * 2)  // 每个采样16位
+static uint8_t audio_buffer[AUDIO_BUFFER_SIZE];
+
+static esp_err_t record_audio_chunk(fs_file_t audio_file) {
+    if (!i2s_handle || !audio_file) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    size_t bytes_read = 0;
+    esp_err_t ret = i2s_channel_read(i2s_handle, audio_buffer, AUDIO_BUFFER_SIZE, &bytes_read, pdMS_TO_TICKS(100));
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to read I2S data: %d", ret);
+        return ret;
+    }
+
+    if (bytes_read > 0) {
+        int bytes_written = fs_write(audio_file, audio_buffer, bytes_read);
+        if (bytes_written != bytes_read) {
+            ESP_LOGE(TAG, "Failed to write audio data to file: %d != %d", bytes_written, bytes_read);
+            return ESP_FAIL;
+        }
+    }
+
     return ESP_OK;
 }
 
 void record_video() {
     // 检查文件系统是否已挂载
     fs_info_t fs_info;
-    esp_err_t ret = fs_get_info(&fs_info);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to get filesystem info (err: %d)", ret);
+    if (fs_get_info(&fs_info) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get filesystem info");
         return;
     }
 
-    // 检查剩余空间
-    if (fs_info.free_bytes < (1024 * 1024)) {  // 至少需要1MB空间
-        ESP_LOGE(TAG, "Not enough space on filesystem (free: %llu bytes)", fs_info.free_bytes);
-        return;
-    }
-
-    // 设置时区为中国标准时间
-    setenv("TZ", "CST-8", 1);
-    tzset();
-
-    char filename[64];
+    // 创建录制文件
+    char video_path[32];
+    char audio_path[32];
     time_t now;
-    struct tm timeinfo;
     time(&now);
+    struct tm timeinfo;
     localtime_r(&now, &timeinfo);
     
-    // 使用更简短的文件名格式
-    snprintf(filename, sizeof(filename), MOUNT_POINT "/V%02d%02d%02d.mp4",
-             timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    // 使用更短的文件名格式：HHMM.xxx
+    snprintf(video_path, sizeof(video_path), "%02d%02d.vid",
+             timeinfo.tm_hour, timeinfo.tm_min);
              
-    ESP_LOGI(TAG, "Starting video recording to: %s", filename);
-    
-    // 尝试以二进制写入模式打开文件
-    fs_file_t fp = fs_open(filename, FS_FILE_WRITE);
-    if (fp == NULL) {
-        ESP_LOGE(TAG, "Failed to open file for writing: %s", filename);
+    snprintf(audio_path, sizeof(audio_path), "%02d%02d.pcm",
+             timeinfo.tm_hour, timeinfo.tm_min);
+
+    // 检查文件是否已存在
+    if (fs_exists(video_path)) {
+        ESP_LOGE(TAG, "Video file already exists: %s", video_path);
+        return;
+    }
+    if (fs_exists(audio_path)) {
+        ESP_LOGE(TAG, "Audio file already exists: %s", audio_path);
         return;
     }
 
-    // 分配I2S缓冲区
-    size_t audio_buf_len = 1024;  // 每次读取1KB音频数据
-    int16_t* i2s_buffer = heap_caps_malloc(audio_buf_len, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (i2s_buffer == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate I2S buffer");
-        fs_close(fp);
+    // 打开视频文件
+    fs_file_t video_file = fs_open(video_path, FS_FILE_WRITE);
+    if (video_file == NULL) {
+        ESP_LOGE(TAG, "Failed to open video file for writing: %s", video_path);
         return;
     }
 
-    // 开始录制
-    int frame_count = 0;
-    int write_errors = 0;
-    int64_t fr_start = esp_timer_get_time();
+    // 打开音频文件
+    fs_file_t audio_file = fs_open(audio_path, FS_FILE_WRITE);
+    if (audio_file == NULL) {
+        ESP_LOGE(TAG, "Failed to open audio file for writing: %s", audio_path);
+        fs_close(video_file);
+        return;
+    }
 
+    ESP_LOGI(TAG, "Started recording to:");
+    ESP_LOGI(TAG, "Video: %s", video_path);
+    ESP_LOGI(TAG, "Audio: %s", audio_path);
+
+    uint32_t frame_count = 0;
+    uint64_t start_time = esp_timer_get_time();
+    const uint64_t RECORD_TIME_US = 30 * 1000 * 1000; // 30 seconds
+
+    // 初始化摄像头
+    camera_fb_t *fb = NULL;
     ESP_LOGI(TAG, "Starting capture loop...");
-    while ((esp_timer_get_time() - fr_start) < (10 * 1000000)) {
-        // 获取一帧图像
-        camera_fb_t* pic = esp_camera_fb_get();
-        if (!pic) {
-            ESP_LOGE(TAG, "Failed to get camera frame");
-            write_errors++;
+
+    while ((esp_timer_get_time() - start_time) < RECORD_TIME_US) {
+        // 捕获视频帧
+        fb = esp_camera_fb_get();
+        if (!fb) {
+            ESP_LOGE(TAG, "Failed to capture frame");
             continue;
         }
 
-        // 写入视频帧
-        int bytes_written = fs_write(fp, pic->buf, pic->len);
-        if (bytes_written != pic->len) {
-            ESP_LOGE(TAG, "Failed to write frame data: written %d of %d bytes", bytes_written, pic->len);
-            write_errors++;
-        }
-
-        // 读取音频数据
-        size_t bytes_read = 0;
-        esp_err_t i2s_err = i2s_channel_read(I2S_NUM_0, i2s_buffer, audio_buf_len, &bytes_read, portMAX_DELAY);
-        if (i2s_err == ESP_OK && bytes_read > 0) {
-            // 写入音频数据
-            bytes_written = fs_write(fp, i2s_buffer, bytes_read);
-            if (bytes_written != bytes_read) {
-                ESP_LOGE(TAG, "Failed to write audio data: written %d of %d bytes", bytes_written, bytes_read);
-                write_errors++;
+        // 写入视频数据
+        int written = fs_write(video_file, fb->buf, fb->len);
+        if (written != fb->len) {
+            ESP_LOGE(TAG, "Failed to write frame data: written %d of %d bytes", written, fb->len);
+        } else {
+            frame_count++;
+            if (frame_count % 30 == 0) {
+                ESP_LOGI(TAG, "Recorded %" PRIu32 " frames", frame_count);
             }
-        } else if (i2s_err != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to read I2S data: %d", i2s_err);
         }
 
-        esp_camera_fb_return(pic);
-        frame_count++;
+        // 释放帧缓冲区
+        esp_camera_fb_return(fb);
 
-        // 每秒打印一次状态
-        if (frame_count % 30 == 0) {
-            int elapsed_sec = (esp_timer_get_time() - fr_start) / 1000000;
-            ESP_LOGI(TAG, "Recording... %d seconds, %d frames captured", elapsed_sec, frame_count);
+        // 录制音频
+        if (record_audio_chunk(audio_file) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to record audio chunk");
+        }
+
+        // 给其他任务一些执行时间
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // 录制完成，关闭文件
+    fs_close(video_file);
+    fs_close(audio_file);
+
+    ESP_LOGI(TAG, "Recording finished. Recorded %" PRIu32 " frames", frame_count);
+
+    // 获取并打印文件信息
+    fs_file_info_t video_info;
+    fs_file_info_t audio_info;
+    
+    if (fs_stat(video_path, &video_info) == ESP_OK) {
+        struct tm timeinfo;
+        time_t modified_time = (time_t)video_info.last_modified;
+        localtime_r(&modified_time, &timeinfo);
+        
+        ESP_LOGI(TAG, "Video file information:");
+        ESP_LOGI(TAG, "- Path: %s", video_path);
+        ESP_LOGI(TAG, "- Size: %" PRIu64 " bytes", video_info.size);
+        ESP_LOGI(TAG, "- Created: %04d-%02d-%02d %02d:%02d:%02d",
+                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
+    
+    if (fs_stat(audio_path, &audio_info) == ESP_OK) {
+        struct tm timeinfo;
+        time_t modified_time = (time_t)audio_info.last_modified;
+        localtime_r(&modified_time, &timeinfo);
+        
+        ESP_LOGI(TAG, "Audio file information:");
+        ESP_LOGI(TAG, "- Path: %s", audio_path);
+        ESP_LOGI(TAG, "- Size: %" PRIu64 " bytes", audio_info.size);
+        ESP_LOGI(TAG, "- Created: %04d-%02d-%02d %02d:%02d:%02d",
+                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
+
+    // 计算平均帧率
+    float elapsed_time = (float)(esp_timer_get_time() - start_time) / 1000000.0f; // 转换为秒
+    float fps = frame_count / elapsed_time;
+    ESP_LOGI(TAG, "Recording statistics:");
+    ESP_LOGI(TAG, "- Duration: %.2f seconds", elapsed_time);
+    ESP_LOGI(TAG, "- Average FPS: %.2f", fps);
+    ESP_LOGI(TAG, "- Total frames: %" PRIu32, frame_count);
+
+    ESP_LOGI(TAG, "Video saved to: %s", video_path);
+    ESP_LOGI(TAG, "Audio saved to: %s", audio_path);
+}
+
+// 添加文件传输命令处理函数
+static void handle_transfer_command(const char* file_path) {
+    fs_file_t file = fs_open(file_path, FS_FILE_READ);
+    if (file == NULL) {
+        printf("Error: Could not open file %s\n", file_path);
+        return;
+    }
+
+    // 打印文件大小
+    fs_file_info_t info;
+    if (fs_stat(file_path, &info) != ESP_OK) {
+        printf("Error: Could not get file info\n");
+        fs_close(file);
+        return;
+    }
+    printf("File size: %" PRIu64 " bytes\n", info.size);
+    printf("Transfer starting...\n");
+
+    // 以十六进制格式传输文件内容
+    uint8_t buffer[1024];
+    size_t bytes_read;
+    uint32_t total_bytes = 0;
+
+    while ((bytes_read = fs_read(file, buffer, sizeof(buffer))) > 0) {
+        for (size_t i = 0; i < bytes_read; i++) {
+            printf("%02x", buffer[i]);
+        }
+        total_bytes += bytes_read;
+        
+        // 每传输64KB打印一次进度
+        if (total_bytes % (64 * 1024) == 0) {
+            printf("\nTransferred: %u bytes (%.1f%%)\n", 
+                   total_bytes, (total_bytes * 100.0f) / info.size);
         }
     }
 
-    // 清理并关闭文件
-    free(i2s_buffer);
-    fs_close(fp);
+    printf("\nTransfer complete: %u bytes transferred\n", total_bytes);
+    fs_close(file);
+}
 
-    float fps = frame_count / ((float)10);
-    ESP_LOGI(TAG, "Recording finished: %d frames in %d seconds (%.1f fps)", 
-             frame_count, 10, fps);
-    if (write_errors > 0) {
-        ESP_LOGW(TAG, "There were %d write errors during recording", write_errors);
+// 添加命令处理函数
+static int console_handler(int argc, char **argv) {
+    if (argc < 1) {
+        return 0;
     }
+
+    if (strcmp(argv[0], "transfer") == 0) {
+        if (argc != 2) {
+            printf("Usage: transfer <filename>\n");
+            printf("Example: transfer 0000.vid\n");
+            return 0;
+        }
+        handle_transfer_command(argv[1]);
+    } else if (strcmp(argv[0], "ls") == 0) {
+        // 列出根目录下的所有文件
+        fs_dir_iterator_t it;
+        if (fs_opendir("/", &it) != ESP_OK) {
+            printf("Error: Could not open root directory\n");
+            return 0;
+        }
+
+        fs_file_info_t info;
+        while (fs_readdir(it, &info) == ESP_OK && info.name[0] != '\0') {
+            if (!info.is_directory) {
+                printf("%s\t%" PRIu64 " bytes\n", info.name, info.size);
+            }
+        }
+        fs_closedir(it);
+    }
+
+    return 0;
 }
 
 void app_main(void)
@@ -308,14 +450,34 @@ void app_main(void)
     ESP_ERROR_CHECK(init_sdcard());
     ESP_ERROR_CHECK(init_i2s());
 
+    // 注册命令
+    esp_console_repl_t *repl = NULL;
+    esp_console_repl_config_t repl_config = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
+    repl_config.prompt = "esp32> ";
+    repl_config.max_cmdline_length = 256;
+
+    esp_console_dev_uart_config_t uart_config = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_console_new_repl_uart(&uart_config, &repl_config, &repl));
+
+    esp_console_cmd_t cmd = {
+        .command = "transfer",
+        .help = "Transfer file content. Usage: transfer <filename>",
+        .hint = NULL,
+        .func = &console_handler,
+    };
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+
+    cmd.command = "ls";
+    cmd.help = "List files in root directory";
+    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
+
+    ESP_ERROR_CHECK(esp_console_start_repl(repl));
+
     // Start recording
     record_video();
 
-    // Clean up
-    if (i2s_handle) {
-        i2s_channel_disable(i2s_handle);
-        i2s_del_channel(i2s_handle);
-    }
+    // Cleanup
+    deinit_i2s();
     fs_deinit();
     ESP_LOGI(TAG, "Cleanup completed");
 }

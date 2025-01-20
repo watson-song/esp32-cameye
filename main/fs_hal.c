@@ -17,7 +17,8 @@ static char s_mount_point[ESP_VFS_PATH_MAX] = { 0 };
 static bool s_is_mounted = false;
 static sdcard_t* s_card = NULL;
 
-#define FS_MAX_PATH_LEN 128  // 设置合适的路径长度
+// 设置合适的路径长度，FAT文件系统支持更长的路径
+#define FS_MAX_PATH_LEN 256
 
 // 目录迭代器结构体
 struct fs_dir_iterator_s {
@@ -61,6 +62,7 @@ static esp_err_t build_full_path(char* full_path, size_t max_len, const char* ba
     // 跳过路径开头的斜杠
     while (*path == '/') {
         path++;
+        path_len--;
     }
 
     // 复制路径
@@ -664,38 +666,11 @@ fs_file_t fs_open(const char* path, fs_mode_t mode) {
 
     // 构建完整路径
     char full_path[FS_MAX_PATH_LEN];
-    if (strncmp(path, s_mount_point, strlen(s_mount_point)) == 0) {
-        // 路径已经包含挂载点，直接使用
-        strncpy(full_path, path, sizeof(full_path) - 1);
-        full_path[sizeof(full_path) - 1] = '\0';
-    } else {
-        // 需要添加挂载点
-        int len = snprintf(full_path, sizeof(full_path), "%s%s%s", 
-                          s_mount_point, 
-                          (path[0] == '/') ? "" : "/",
-                          (path[0] == '/') ? path + 1 : path);
-        if (len >= sizeof(full_path)) {
-            ESP_LOGE(TAG, "Path too long: '%s%s%s'", 
-                    s_mount_point, 
-                    (path[0] == '/') ? "" : "/",
-                    (path[0] == '/') ? path + 1 : path);
-            return NULL;
-        }
+    esp_err_t ret = build_full_path(full_path, sizeof(full_path), s_mount_point, path);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to build full path for %s", path);
+        return NULL;
     }
-
-    // 规范化路径（去除多余的斜杠）
-    char* src = full_path;
-    char* dst = full_path;
-    char prev = '\0';
-    while (*src) {
-        if (*src != '/' || prev != '/') {
-            *dst = *src;
-            prev = *src;
-            dst++;
-        }
-        src++;
-    }
-    *dst = '\0';
 
     const char* mode_str;
     switch (mode) {
